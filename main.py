@@ -199,7 +199,6 @@ class Encoder(torch.nn.Module):
 
 
 class SSF(torch.nn.Module):
-    global best_loss, best_acc, features, edge_index, labels
 
     def __init__(self, encoder: Encoder, num_hidden: int, num_proj_hidden: int,
                 sim_coeff: float = 0.5, nclass: int=1):
@@ -329,7 +328,7 @@ class SSF(torch.nn.Module):
         correct = (preds == labels[idx_test]).sum().item()
         return preds, correct/preds.shape[0]
 
-    def fit(best_loss = 100):
+    def fit(self,best_loss, features, edge_index, labels):
         for epoch in range(args.epochs + 1):
             # t = time.time()
             if args.model == 'ssf':
@@ -587,7 +586,7 @@ labels = labels.to(device)
 ##### Code: ########
 # fit(best_loss)
 if args.model == 'ssf':
-    SSF.fit(best_loss)
+    SSF.fit(best_loss, features, edge_index, labels)
     print("Total time elapsed: {:.4f}s".format(time.time() - t_total))
 
 
