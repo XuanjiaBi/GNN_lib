@@ -586,7 +586,7 @@ labels = labels.to(device)
 ##### Code: ########
 # fit(best_loss)
 if args.model == 'ssf':
-    SSF.fit(best_loss, features, edge_index, labels)
+    model.fit(best_loss, features, edge_index, labels)
     print("Total time elapsed: {:.4f}s".format(time.time() - t_total))
 
 
