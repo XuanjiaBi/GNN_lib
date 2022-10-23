@@ -230,7 +230,17 @@ class SSF(torch.nn.Module):
 
         for m in self.modules():
             self.weights_init(m)
-
+        self.val_edge_index_1 = dropout_adj(edge_index.to(device), p=args.drop_edge_rate_1)[0]
+        self.val_edge_index_2 = dropout_adj(edge_index.to(device), p=args.drop_edge_rate_2)[0]
+        self.to(device)
+        self.val_x_1 = drop_feature(features.to(device), args.drop_feature_rate_2, sens_idx, sens_flag=False)
+        self.val_x_1 = drop_feature(features.to(device), args.drop_feature_rate_2, sens_idx, sens_flag=False)
+        self.val_x_2 = drop_feature(features.to(device), args.drop_feature_rate_2, sens_idx)
+        par_1 = list(self.encoder.parameters()) + list(self.fc1.parameters()) + list(self.fc2.parameters()) + list(
+            self.fc3.parameters()) + list(self.fc4.parameters())
+        par_2 = list(self.c1.parameters()) + list(self.encoder.parameters())
+        self.optimizer_1 = optim.Adam(par_1, lr=args.lr, weight_decay=args.weight_decay)
+        self.optimizer_2 = optim.Adam(par_2, lr=args.lr, weight_decay=args.weight_decay)
     def weights_init(self, m):
         if isinstance(m, nn.Linear):
             torch.nn.init.xavier_uniform_(m.weight.data)
@@ -300,10 +310,10 @@ class SSF(torch.nn.Module):
     def predict(self, emb):
 
         # projector
-        p1 = self.projection(emb)
-
-        # predictor
-        h1 = self.prediction(p1)
+        # p1 = self.projection(emb)
+        #
+        # # predictor
+        # h1 = self.prediction(p1)
 
         # classifier
         c1 = self.classifier(emb)
@@ -337,8 +347,8 @@ class SSF(torch.nn.Module):
                 rep = 1
                 for _ in range(rep):
                     model.train()
-                    optimizer_1.zero_grad()
-                    optimizer_2.zero_grad()
+                    self.optimizer_1.zero_grad()
+                    self.optimizer_2.zero_grad()
                     edge_index_1 = dropout_adj(edge_index, p=args.drop_edge_rate_1)[0]
                     edge_index_2 = dropout_adj(edge_index, p=args.drop_edge_rate_2)[0]
                     x_1 = drop_feature(features, args.drop_feature_rate_2, sens_idx, sens_flag=False)
@@ -359,7 +369,7 @@ class SSF(torch.nn.Module):
                     sim_loss += args.sim_coeff * (l1 + l2)
 
                 (sim_loss / rep).backward()
-                optimizer_1.step()
+                self.optimizer_1.step()
 
                 # classifier
                 z1 = model(x_1, edge_index_1)
@@ -375,14 +385,14 @@ class SSF(torch.nn.Module):
 
                 cl_loss = (1 - args.sim_coeff) * (l3 + l4)
                 cl_loss.backward()
-                optimizer_2.step()
+                self.optimizer_2.step()
                 loss = (sim_loss / rep + cl_loss)
 
                 # Validation
                 model.eval()
-                val_s_loss, val_c_loss = ssf_validation(model, val_x_1, val_edge_index_1, val_x_2, val_edge_index_2,
+                val_s_loss, val_c_loss = ssf_validation(self, self.val_x_1, self.val_edge_index_1, self.val_x_2, self.val_edge_index_2,
                                                         labels)
-                emb = model(val_x_1, val_edge_index_1)
+                emb = model(self.val_x_1, self.val_edge_index_1)
                 output = model.predict(emb)
                 preds = (output.squeeze() > 0).type_as(labels)
                 auc_roc_val = roc_auc_score(labels.cpu().numpy()[idx_val], output.detach().cpu().numpy()[idx_val])
@@ -449,55 +459,111 @@ def fair_metric(pred, labels, sens):
     equality = abs(sum(pred[idx_s0_y1])/sum(idx_s0_y1)-sum(pred[idx_s1_y1])/sum(idx_s1_y1))
     return parity.item(), equality.item()
 
-
-# Training settings
-parser = argparse.ArgumentParser()
-parser.add_argument('--no-cuda', action='store_true', default=False,
-                    help='Disables CUDA training.')
-parser.add_argument('--seed', type=int, default=0, help='Random seed.')
-parser.add_argument('--epochs', type=int, default=300,
-                    help='Number of epochs to train.')
-parser.add_argument('--lr', type=float, default=0.001,
-                    help='Initial learning rate.')
-parser.add_argument('--weight_decay', type=float, default=1e-5,
-                    help='Weight decay (L2 loss on parameters).')
-parser.add_argument('--hidden', type=int, default=16,
-                    help='Number of hidden units.')
-parser.add_argument('--proj_hidden', type=int, default=16,
-                    help='Number of hidden units in the projection layer of encoder.')
-parser.add_argument('--dropout', type=float, default=0.5,
-                    help='Dropout rate (1 - keep probability).')
-parser.add_argument('--drop_edge_rate_1', type=float, default=0.1,
-                    help='drop edge for first augmented graph')
-parser.add_argument('--drop_edge_rate_2', type=float, default=0.1,
-                    help='drop edge for second augmented graph')
-parser.add_argument('--drop_feature_rate_1', type=float, default=0.1,
-                    help='drop feature for first augmented graph')
-parser.add_argument('--drop_feature_rate_2', type=float, default=0.1,
-                    help='drop feature for second augmented graph')
-parser.add_argument('--sim_coeff', type=float, default=0.5,
-                    help='regularization coeff for the self-supervised task')
-parser.add_argument('--dataset', type=str, default='loan',
-                    choices=['nba','bail','loan', 'credit', 'german'])
-parser.add_argument("--num_heads", type=int, default=1,
+def set_training():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--no-cuda', action='store_true', default=False,
+                        help='Disables CUDA training.')
+    parser.add_argument('--seed', type=int, default=0, help='Random seed.')
+    parser.add_argument('--epochs', type=int, default=300,
+                        help='Number of epochs to train.')
+    parser.add_argument('--lr', type=float, default=0.001,
+                        help='Initial learning rate.')
+    parser.add_argument('--weight_decay', type=float, default=1e-5,
+                        help='Weight decay (L2 loss on parameters).')
+    parser.add_argument('--hidden', type=int, default=16,
+                        help='Number of hidden units.')
+    parser.add_argument('--proj_hidden', type=int, default=16,
+                        help='Number of hidden units in the projection layer of encoder.')
+    parser.add_argument('--dropout', type=float, default=0.5,
+                        help='Dropout rate (1 - keep probability).')
+    parser.add_argument('--drop_edge_rate_1', type=float, default=0.1,
+                        help='drop edge for first augmented graph')
+    parser.add_argument('--drop_edge_rate_2', type=float, default=0.1,
+                        help='drop edge for second augmented graph')
+    parser.add_argument('--drop_feature_rate_1', type=float, default=0.1,
+                        help='drop feature for first augmented graph')
+    parser.add_argument('--drop_feature_rate_2', type=float, default=0.1,
+                        help='drop feature for second augmented graph')
+    parser.add_argument('--sim_coeff', type=float, default=0.5,
+                        help='regularization coeff for the self-supervised task')
+    parser.add_argument('--dataset', type=str, default='loan',
+                        choices=['nba', 'bail', 'loan', 'credit', 'german'])
+    parser.add_argument("--num_heads", type=int, default=1,
                         help="number of hidden attention heads")
-parser.add_argument("--num_out_heads", type=int, default=1,
-                    help="number of output attention heads")
-parser.add_argument("--num_layers", type=int, default=2,
+    parser.add_argument("--num_out_heads", type=int, default=1,
+                        help="number of output attention heads")
+    parser.add_argument("--num_layers", type=int, default=2,
                         help="number of hidden layers")
-parser.add_argument('--model', type=str, default='gcn',
-                    choices=['gcn', 'sage', 'gin', 'jk', 'infomax', 'ssf', 'rogcn'])
-parser.add_argument('--encoder', type=str, default='gcn')
-print("parser: ", parser)
+    parser.add_argument('--model', type=str, default='gcn',
+                        choices=['gcn', 'sage', 'gin', 'jk', 'infomax', 'ssf', 'rogcn'])
 
-args = parser.parse_known_args()[0]
-args.cuda = not args.no_cuda and torch.cuda.is_available()
+    parser.add_argument('--encoder', type=str, default='gcn')
+    args = parser.parse_known_args()[0]
+    args.cuda = not args.no_cuda and torch.cuda.is_available()
 
-# set seeds
-np.random.seed(args.seed)
-torch.manual_seed(args.seed)
-if args.cuda:
-    torch.cuda.manual_seed(args.seed)
+    # set seeds
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if args.cuda:
+        torch.cuda.manual_seed(args.seed)
+    return args
+# Training settings
+
+def loaddata(dataset):
+    if dataset == 'credit':
+        sens_attr = "Age"  # column number after feature process is 1
+        sens_idx = 1
+        predict_attr = 'NoDefaultNextMonth'
+        label_number = 6000
+        path_credit = "dataset/credit"
+        adj, features, labels, idx_train, idx_val, idx_test, sens = load_credit(args.dataset, sens_attr,
+                                                                                predict_attr, path=path_credit,
+                                                                                label_number=label_number
+                                                                                )
+        norm_features = feature_norm(features)
+        norm_features[:, sens_idx] = features[:, sens_idx]
+        features = norm_features
+
+    # Load german dataset
+    elif dataset == 'german':
+        sens_attr = "Gender"  # column number after feature process is 0
+        sens_idx = 0
+        predict_attr = "GoodCustomer"
+        label_number = 100
+        path_german = "dataset/german"
+        adj, features, labels, idx_train, idx_val, idx_test, sens = load_german(args.dataset, sens_attr,
+                                                                                predict_attr, path=path_german,
+                                                                                label_number=label_number,
+                                                                                )
+    # Load bail dataset
+    elif dataset == 'bail':
+        sens_attr = "WHITE"  # column number after feature process is 0
+        sens_idx = 0
+        predict_attr = "RECID"
+        label_number = 100
+        path_bail = "dataset/bail"
+        adj, features, labels, idx_train, idx_val, idx_test, sens = load_bail(args.dataset, sens_attr,
+                                                                              predict_attr, path=path_bail,
+                                                                              label_number=label_number,
+                                                                              )
+        norm_features = feature_norm(features)
+        norm_features[:, sens_idx] = features[:, sens_idx]
+        features = norm_features
+    else:
+        print('Invalid dataset name!!')
+        exit(0)
+    return adj, features, labels, idx_train, idx_val, idx_test, sens,sens_idx
+
+
+#### Start ####
+
+# Training setting
+args = set_training()
+# print(args.dataset)
+# print("args: ", args)
+
+# Load data
+adj, features, labels, idx_train, idx_val, idx_test, sens,sens_idx=loaddata(args.dataset)
 
 # torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -505,72 +571,17 @@ torch.backends.cudnn.allow_tf32 = False
 # set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Load data
-# print(args.dataset)
-
-# Load credit_scoring dataset
-if args.dataset == 'credit':
-	sens_attr = "Age"  # column number after feature process is 1
-	sens_idx = 1
-	predict_attr = 'NoDefaultNextMonth'
-	label_number = 6000
-	path_credit = "dataset/credit"
-	adj, features, labels, idx_train, idx_val, idx_test, sens = load_credit(args.dataset, sens_attr,
-	                                                                        predict_attr, path=path_credit,
-	                                                                        label_number=label_number
-	                                                                        )
-	norm_features = feature_norm(features)
-	norm_features[:, sens_idx] = features[:, sens_idx]
-	features = norm_features
-
-# Load german dataset
-elif args.dataset == 'german':
-	sens_attr = "Gender"  # column number after feature process is 0
-	sens_idx = 0
-	predict_attr = "GoodCustomer"
-	label_number = 100
-	path_german = "dataset/german"
-	adj, features, labels, idx_train, idx_val, idx_test, sens = load_german(args.dataset, sens_attr,
-	                                                                        predict_attr, path=path_german,
-	                                                                        label_number=label_number,
-	                                                                        )
-# Load bail dataset
-elif args.dataset == 'bail':
-	sens_attr = "WHITE"  # column number after feature process is 0
-	sens_idx = 0
-	predict_attr = "RECID"
-	label_number = 100
-	path_bail = "dataset/bail"
-	adj, features, labels, idx_train, idx_val, idx_test, sens = load_bail(args.dataset, sens_attr,
-																			predict_attr, path=path_bail,
-	                                                                        label_number=label_number,
-	                                                                        )
-	norm_features = feature_norm(features)
-	norm_features[:, sens_idx] = features[:, sens_idx]
-	features = norm_features
-else:
-	print('Invalid dataset name!!')
-	exit(0)
-
 edge_index = convert.from_scipy_sparse_matrix(adj)[0]
 
 #%%
 # Model and optimizer
-num_class = labels.unique().shape[0]-1
+# num_class = labels.unique().shape[0]-1
 print("Running model: ",args.model)
 
 if args.model == 'ssf':
-	encoder = Encoder(in_channels=features.shape[1], out_channels=args.hidden, base_model=args.encoder).to(device)
-	model = SSF(encoder=encoder, num_hidden=args.hidden, num_proj_hidden=args.proj_hidden, sim_coeff=args.sim_coeff, nclass=num_class).to(device)
-	val_edge_index_1 = dropout_adj(edge_index.to(device), p=args.drop_edge_rate_1)[0]
-	val_edge_index_2 = dropout_adj(edge_index.to(device), p=args.drop_edge_rate_2)[0]
-	val_x_1 = drop_feature(features.to(device), args.drop_feature_rate_2, sens_idx, sens_flag=False)
-	val_x_2 = drop_feature(features.to(device), args.drop_feature_rate_2, sens_idx)
-	par_1 = list(model.encoder.parameters()) + list(model.fc1.parameters()) + list(model.fc2.parameters()) + list(model.fc3.parameters()) + list(model.fc4.parameters())
-	par_2 = list(model.c1.parameters()) + list(model.encoder.parameters())
-	optimizer_1 = optim.Adam(par_1, lr=args.lr, weight_decay=args.weight_decay)
-	optimizer_2 = optim.Adam(par_2, lr=args.lr, weight_decay=args.weight_decay)
-	model = model.to(device)
+	# encoder = Encoder(in_channels=features.shape[1], out_channels=args.hidden, base_model=args.encoder).to(device)
+	model = SSF(Encoder(in_channels=features.shape[1], out_channels=args.hidden, base_model=args.encoder).to(device), num_hidden=args.hidden, num_proj_hidden=args.proj_hidden,sim_coeff=args.sim_coeff, nclass=labels.unique().shape[0]-1).to(device)
+	# model = model.to(device)
 else:
     print("invalid model")
 
@@ -583,13 +594,9 @@ features = features.to(device)
 edge_index = edge_index.to(device)
 labels = labels.to(device)
 
-##### Code: ########
-# fit(best_loss)
 if args.model == 'ssf':
     model.fit(best_loss, features, edge_index, labels)
     print("Total time elapsed: {:.4f}s".format(time.time() - t_total))
-
-
 
 model.load_state_dict(torch.load(f'weights_ssf_{args.encoder}.pt'))
 model.eval()
