@@ -203,6 +203,7 @@ class SSF(torch.nn.Module):
     def __init__(self, encoder: Encoder, num_hidden: int, num_proj_hidden: int,
                 sim_coeff: float = 0.5, nclass: int=1):
         super(SSF, self).__init__()
+
         self.encoder: Encoder = encoder
         self.sim_coeff: float = sim_coeff
 
@@ -241,6 +242,7 @@ class SSF(torch.nn.Module):
         par_2 = list(self.c1.parameters()) + list(self.encoder.parameters())
         self.optimizer_1 = optim.Adam(par_1, lr=args.lr, weight_decay=args.weight_decay)
         self.optimizer_2 = optim.Adam(par_2, lr=args.lr, weight_decay=args.weight_decay)
+
     def weights_init(self, m):
         if isinstance(m, nn.Linear):
             torch.nn.init.xavier_uniform_(m.weight.data)
@@ -338,7 +340,7 @@ class SSF(torch.nn.Module):
         correct = (preds == labels[idx_test]).sum().item()
         return preds, correct/preds.shape[0]
 
-    def fit(self,best_loss, features, edge_index, labels):
+    def fit(model, best_loss, features, edge_index, labels):
         for epoch in range(args.epochs + 1):
             # t = time.time()
             if args.model == 'ssf':
@@ -347,8 +349,8 @@ class SSF(torch.nn.Module):
                 rep = 1
                 for _ in range(rep):
                     model.train()
-                    self.optimizer_1.zero_grad()
-                    self.optimizer_2.zero_grad()
+                    model.optimizer_1.zero_grad()
+                    model.optimizer_2.zero_grad()
                     edge_index_1 = dropout_adj(edge_index, p=args.drop_edge_rate_1)[0]
                     edge_index_2 = dropout_adj(edge_index, p=args.drop_edge_rate_2)[0]
                     x_1 = drop_feature(features, args.drop_feature_rate_2, sens_idx, sens_flag=False)
@@ -369,7 +371,7 @@ class SSF(torch.nn.Module):
                     sim_loss += args.sim_coeff * (l1 + l2)
 
                 (sim_loss / rep).backward()
-                self.optimizer_1.step()
+                model.optimizer_1.step()
 
                 # classifier
                 z1 = model(x_1, edge_index_1)
@@ -385,14 +387,14 @@ class SSF(torch.nn.Module):
 
                 cl_loss = (1 - args.sim_coeff) * (l3 + l4)
                 cl_loss.backward()
-                self.optimizer_2.step()
+                model.optimizer_2.step()
                 loss = (sim_loss / rep + cl_loss)
 
                 # Validation
                 model.eval()
-                val_s_loss, val_c_loss = ssf_validation(self, self.val_x_1, self.val_edge_index_1, self.val_x_2, self.val_edge_index_2,
+                val_s_loss, val_c_loss = ssf_validation(model, model.val_x_1, model.val_edge_index_1, model.val_x_2, model.val_edge_index_2,
                                                         labels)
-                emb = model(self.val_x_1, self.val_edge_index_1)
+                emb = model(model.val_x_1, model.val_edge_index_1)
                 output = model.predict(emb)
                 preds = (output.squeeze() > 0).type_as(labels)
                 auc_roc_val = roc_auc_score(labels.cpu().numpy()[idx_val], output.detach().cpu().numpy()[idx_val])
@@ -405,6 +407,20 @@ class SSF(torch.nn.Module):
                     best_loss = val_c_loss + val_s_loss
                     torch.save(model.state_dict(), f'weights_ssf_{args.encoder}.pt')
         print("Optimization Finished!")
+
+    def report(self, output, labels):
+        output_preds = (output.squeeze() > 0).type_as(labels)
+        counter_output_preds = (counter_output.squeeze() > 0).type_as(labels)
+        noisy_output_preds = (noisy_output.squeeze() > 0).type_as(labels)
+        auc_roc_test = roc_auc_score(labels.cpu().numpy()[idx_test.cpu()],
+                                     output.detach().cpu().numpy()[idx_test.cpu()])
+        counterfactual_fairness = 1 - (output_preds.eq(counter_output_preds)[idx_test].sum().item() / idx_test.shape[0])
+        robustness_score = 1 - (output_preds.eq(noisy_output_preds)[idx_test].sum().item() / idx_test.shape[0])
+        parity, equality = fair_metric(output_preds[idx_test].cpu().numpy(), labels[idx_test].cpu().numpy(),
+                                       sens[idx_test].numpy())
+        f1_s = f1_score(labels[idx_test].cpu().numpy(), output_preds[idx_test].cpu().numpy())
+        return auc_roc_test, counterfactual_fairness,robustness_score,parity, equality,f1_s
+
 
 def drop_feature(x, drop_prob, sens_idx, sens_flag=True):
     drop_mask = torch.empty(
@@ -554,6 +570,17 @@ def loaddata(dataset):
         exit(0)
     return adj, features, labels, idx_train, idx_val, idx_test, sens,sens_idx
 
+def statistics(model,args):
+    model.load_state_dict(torch.load(f'weights_ssf_{args.encoder}.pt'))
+    model.eval()
+    emb = model(features.to(device), edge_index.to(device))
+    output = model.predict(emb)
+    counter_features = features.clone()
+    counter_features[:, sens_idx] = 1 - counter_features[:, sens_idx]
+    counter_output = model.predict(model(counter_features.to(device), edge_index.to(device)))
+    noisy_features = features.clone() + torch.ones(features.shape).normal_(0, 1).to(device)
+    noisy_output = model.predict(model(noisy_features.to(device), edge_index.to(device)))
+    return emb,output,counter_features,counter_output,noisy_features,noisy_output
 
 #### Start ####
 
@@ -579,46 +606,25 @@ edge_index = convert.from_scipy_sparse_matrix(adj)[0]
 print("Running model: ",args.model)
 
 if args.model == 'ssf':
-	# encoder = Encoder(in_channels=features.shape[1], out_channels=args.hidden, base_model=args.encoder).to(device)
 	model = SSF(Encoder(in_channels=features.shape[1], out_channels=args.hidden, base_model=args.encoder).to(device), num_hidden=args.hidden, num_proj_hidden=args.proj_hidden,sim_coeff=args.sim_coeff, nclass=labels.unique().shape[0]-1).to(device)
-	# model = model.to(device)
 else:
     print("invalid model")
 
 # Train model
-
 t_total = time.time()
 best_loss = 100
 best_acc = 0
 features = features.to(device)
 edge_index = edge_index.to(device)
 labels = labels.to(device)
-
 if args.model == 'ssf':
     model.fit(best_loss, features, edge_index, labels)
     print("Total time elapsed: {:.4f}s".format(time.time() - t_total))
 
-model.load_state_dict(torch.load(f'weights_ssf_{args.encoder}.pt'))
-model.eval()
-emb = model(features.to(device), edge_index.to(device))
-output = model.predict(emb)
-counter_features = features.clone()
-counter_features[:, sens_idx] = 1 - counter_features[:, sens_idx]
-counter_output = model.predict(model(counter_features.to(device), edge_index.to(device)))
-noisy_features = features.clone() + torch.ones(features.shape).normal_(0, 1).to(device)
-noisy_output = model.predict(model(noisy_features.to(device), edge_index.to(device)))
-
+# Compute statistics
+emb,output,counter_features,counter_output,noisy_features,noisy_output = statistics(model, args)
 # Report
-output_preds = (output.squeeze()>0).type_as(labels)
-counter_output_preds = (counter_output.squeeze()>0).type_as(labels)
-noisy_output_preds = (noisy_output.squeeze()>0).type_as(labels)
-auc_roc_test = roc_auc_score(labels.cpu().numpy()[idx_test.cpu()], output.detach().cpu().numpy()[idx_test.cpu()])
-counterfactual_fairness = 1 - (output_preds.eq(counter_output_preds)[idx_test].sum().item()/idx_test.shape[0])
-robustness_score = 1 - (output_preds.eq(noisy_output_preds)[idx_test].sum().item()/idx_test.shape[0])
-
-parity, equality = fair_metric(output_preds[idx_test].cpu().numpy(), labels[idx_test].cpu().numpy(), sens[idx_test].numpy())
-f1_s = f1_score(labels[idx_test].cpu().numpy(), output_preds[idx_test].cpu().numpy())
-
+auc_roc_test, counterfactual_fairness,robustness_score,parity, equality,f1_s = model.report(output, labels)
 # print report
 print("The AUCROC of estimator: {:.4f}".format(auc_roc_test))
 print(f'Parity: {parity} | Equality: {equality}')
